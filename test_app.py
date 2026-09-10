@@ -12,6 +12,7 @@ def test_app_upload_sku_and_rename(tmp_path: Path) -> None:
     at = AppTest.from_file("app.py", default_timeout=15)
     at.session_state["selected_paths"] = [str(sample)]
     at.session_state["file_ids"] = None
+    at.session_state["parsed"] = None
     at.run()
 
     sku_inputs = [widget for widget in at.text_input if widget.label == CLOCK_DESCRIPTION]
@@ -35,4 +36,4 @@ if __name__ == "__main__":
     for leftover in out.glob("*.pdf"):
         leftover.unlink()
     test_app_upload_sku_and_rename(out)
-    print("app test ok")
+    print("local app test ok")

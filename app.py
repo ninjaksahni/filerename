@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib
 import io
 import zipfile
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 
 import streamlit as st
@@ -16,6 +16,7 @@ importlib.reload(extractor)
 importlib.reload(namer)
 importlib.reload(sku_store)
 
+from deployment import is_cloud_deployment, supports_native_picker
 from extractor import ExtractedChallan, extract_challan, product_key
 from file_picker import pick_pdfs
 from namer import build_filename, unique_filename, zip_name_for_batch
@@ -23,19 +24,34 @@ from sku_store import load_store, lookup_place_code, save_sku_mappings
 
 st.set_page_config(page_title="Challan Renamer", layout="wide")
 
+ParsedItem = tuple[str, bytes, ExtractedChallan, Path | None]
+CLOUD_MODE = is_cloud_deployment()
+
 
 def _file_id(path: Path) -> str:
     stat = path.stat()
     return f"{path.resolve()}:{stat.st_mtime_ns}:{stat.st_size}"
 
 
-def _extract_paths(paths: list[Path]) -> list[tuple[Path, bytes, ExtractedChallan]]:
-    parsed: list[tuple[Path, bytes, ExtractedChallan]] = []
+def _upload_id(uploaded) -> str:
+    return f"{uploaded.name}:{uploaded.size}"
+
+
+def _extract_paths(paths: list[Path]) -> list[ParsedItem]:
+    parsed: list[ParsedItem] = []
     for path in paths:
         if not path.is_file():
             continue
         data = path.read_bytes()
-        parsed.append((path, data, extract_challan(data, path.name)))
+        parsed.append((path.name, data, extract_challan(data, path.name), path))
+    return parsed
+
+
+def _extract_uploads(uploads) -> list[ParsedItem]:
+    parsed: list[ParsedItem] = []
+    for uploaded in uploads:
+        data = uploaded.getvalue()
+        parsed.append((uploaded.name, data, extract_challan(data, uploaded.name), None))
     return parsed
 
 
@@ -73,102 +89,160 @@ def _preview_name(result: ExtractedChallan, sku_by_key: dict[str, str], store: d
 
 
 def _write_renamed(
-    parsed: list[tuple[Path, bytes, ExtractedChallan]],
+    parsed: list[ParsedItem],
     sku_by_key: dict[str, str],
     store: dict,
-) -> tuple[list[dict], bytes, list[Path]]:
-    used_by_dir: dict[Path, set[str]] = defaultdict(set)
+    *,
+    rename_in_place: bool,
+) -> tuple[list[dict], bytes, list[ParsedItem]]:
+    used_names: set[str] = set()
     rows: list[dict] = []
-    updated: list[Path] = []
+    updated: list[ParsedItem] = []
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
-        for source, data, result in parsed:
+        for source_name, data, result, source_path in parsed:
             if not result.ok:
                 rows.append(
                     {
-                        "original": source.name,
+                        "original": source_name,
                         "new_name": "",
                         "status": result.error or "Skipped",
                     }
                 )
-                updated.append(source)
+                updated.append((source_name, data, result, source_path))
                 continue
             try:
-                folder = source.parent
+                ignore = source_path if rename_in_place and source_path else None
+                dest_dir = source_path.parent if source_path else Path(".")
                 new_name = unique_filename(
                     _preview_name(result, sku_by_key, store),
-                    folder,
-                    used_by_dir[folder],
-                    ignore=source,
+                    dest_dir,
+                    used_names,
+                    ignore=ignore,
                 )
-                dest = folder / new_name
-                if dest.resolve() != source.resolve():
-                    source.rename(dest)
+                if rename_in_place and source_path:
+                    dest = source_path.parent / new_name
+                    if dest.resolve() != source_path.resolve():
+                        source_path.rename(dest)
+                    updated.append((new_name, data, result, dest))
+                else:
+                    updated.append((new_name, data, result, None))
                 archive.writestr(new_name, data)
                 rows.append(
                     {
-                        "original": source.name,
+                        "original": source_name,
                         "new_name": new_name,
                         "status": "Renamed",
                     }
                 )
-                updated.append(dest)
             except Exception as exc:  # noqa: BLE001
                 rows.append(
                     {
-                        "original": source.name,
+                        "original": source_name,
                         "new_name": "",
                         "status": str(exc),
                     }
                 )
-                updated.append(source)
+                updated.append((source_name, data, result, source_path))
     return rows, zip_buffer.getvalue(), updated
 
 
+def _load_parsed_from_session() -> list[ParsedItem]:
+    raw = st.session_state.get("parsed", [])
+    parsed: list[ParsedItem] = []
+    for item in raw:
+        if isinstance(item, (list, tuple)) and len(item) == 4:
+            name, data, result, path = item
+            parsed.append(
+                (
+                    str(name),
+                    data,
+                    result,
+                    Path(path) if path and Path(path).exists() else None,
+                )
+            )
+    return parsed
+
+
+def _store_parsed(parsed: list[ParsedItem]) -> None:
+    st.session_state.parsed = [
+        (name, data, result, str(path) if path else None) for name, data, result, path in parsed
+    ]
+
+
+def _reset_results() -> None:
+    st.session_state.rename_rows = None
+    st.session_state.zip_bytes = None
+    st.session_state.zip_filename = None
+
+
 st.title("Delivery Challan Renamer")
-st.caption(
-    "Upload challan PDFs. Each file is renamed in the same folder it was selected from "
-    "as `Challan-SKU-last4-XX-MMMYY.pdf`."
-)
+if CLOUD_MODE:
+    st.caption(
+        "Upload challan PDFs in your browser. Renamed files are packaged as "
+        "`Challan-SKU-last4-XX-MMMYY.pdf` inside a ZIP download."
+    )
+else:
+    st.caption(
+        "Upload challan PDFs. Each file is renamed in the same folder it was selected from "
+        "as `Challan-SKU-last4-XX-MMMYY.pdf`."
+    )
 
 store = load_store()
 if "selected_paths" not in st.session_state:
     st.session_state.selected_paths = []
 
-st.info("After clicking Upload PDFs, look for the macOS file picker — it may open behind this browser window.")
+if CLOUD_MODE or not supports_native_picker():
+    uploads = st.file_uploader(
+        "Upload challan PDFs",
+        type=["pdf"],
+        accept_multiple_files=True,
+    )
+    if not uploads:
+        st.info("Upload one or more delivery challan PDFs to begin.")
+        st.stop()
 
-if st.button("Upload PDFs"):
-    with st.spinner("Waiting for file picker..."):
-        try:
-            chosen = pick_pdfs()
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Could not open the file picker: {exc}")
-            chosen = []
-    if chosen:
-        st.session_state.selected_paths = [str(path) for path in chosen]
-        st.session_state.rename_rows = None
-        st.session_state.zip_bytes = None
-        st.session_state.zip_filename = None
-        st.session_state.file_ids = None
-        st.rerun()
-    elif chosen == []:
-        st.warning("No files selected.")
+    upload_ids = [_upload_id(item) for item in uploads]
+    if st.session_state.get("upload_ids") != upload_ids:
+        st.session_state.upload_ids = upload_ids
+        _store_parsed(_extract_uploads(uploads))
+        _reset_results()
 
-paths = [Path(item) for item in st.session_state.selected_paths if Path(item).is_file()]
-if not paths:
-    st.info("Click Upload PDFs and select one or more delivery challan files.")
-    st.stop()
+    parsed = _load_parsed_from_session()
+    st.write(f"Selected **{len(parsed)}** PDF(s)")
+else:
+    st.info("After clicking Upload PDFs, look for the macOS file picker — it may open behind this browser window.")
 
-st.write(f"Selected **{len(paths)}** PDF(s) from `{paths[0].parent}`")
+    if st.button("Upload PDFs"):
+        with st.spinner("Waiting for file picker..."):
+            try:
+                chosen = pick_pdfs()
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Could not open the file picker: {exc}")
+                chosen = []
+        if chosen:
+            st.session_state.selected_paths = [str(path) for path in chosen]
+            st.session_state.file_ids = None
+            _reset_results()
+            st.rerun()
+        elif chosen == []:
+            st.warning("No files selected.")
 
-file_ids = [_file_id(path) for path in paths]
-if st.session_state.get("file_ids") != file_ids:
-    st.session_state.file_ids = file_ids
-    st.session_state.parsed = _extract_paths(paths)
-    st.session_state.rename_rows = None
-    st.session_state.zip_bytes = None
+    paths = [Path(item) for item in st.session_state.selected_paths if Path(item).is_file()]
+    if not paths:
+        st.info("Click Upload PDFs and select one or more delivery challan files.")
+        st.stop()
 
-parsed: list[tuple[Path, bytes, ExtractedChallan]] = st.session_state.parsed
+    st.write(f"Selected **{len(paths)}** PDF(s) from `{paths[0].parent}`")
+
+    file_ids = [_file_id(path) for path in paths]
+    if st.session_state.get("file_ids") != file_ids:
+        st.session_state.file_ids = file_ids
+        _store_parsed(_extract_paths(paths))
+        _reset_results()
+
+    parsed = _load_parsed_from_session()
+
 results = [item[2] for item in parsed]
 
 st.subheader("Extracted files")
@@ -272,23 +346,37 @@ elif mmmyy_values:
     auto_zip = zip_name_for_batch(mmmyy_values, zip_file_count)
     st.caption(f"ZIP will download as `{auto_zip}`")
 
-if st.button("Rename files", type="primary", disabled=not can_rename):
+rename_label = "Rename and download" if CLOUD_MODE or not supports_native_picker() else "Rename files"
+if st.button(rename_label, type="primary", disabled=not can_rename):
     merged = dict(store["sku_mappings"])
     merged.update({key: sku for key, sku in sku_by_key.items() if sku})
     store = save_sku_mappings(merged)
-    rows, zip_bytes, updated = _write_renamed(parsed, sku_by_key, store)
+    rows, zip_bytes, updated = _write_renamed(
+        parsed,
+        sku_by_key,
+        store,
+        rename_in_place=supports_native_picker() and not CLOUD_MODE,
+    )
     zip_count = sum(1 for row in rows if row["status"] == "Renamed")
     st.session_state.zip_filename = zip_name_for_batch(mmmyy_values, zip_count, zip_name_input)
     st.session_state.rename_rows = rows
     st.session_state.zip_bytes = zip_bytes
-    st.session_state.selected_paths = [str(path) for path in updated]
-    st.session_state.parsed = _extract_paths(updated)
-    st.session_state.file_ids = [_file_id(path) for path in updated if path.is_file()]
+    _store_parsed(updated)
+    if supports_native_picker() and not CLOUD_MODE:
+        st.session_state.selected_paths = [
+            str(path) for _, _, _, path in updated if path is not None
+        ]
+        st.session_state.file_ids = [
+            _file_id(path) for _, _, _, path in updated if path is not None
+        ]
 
 if st.session_state.get("rename_rows"):
     saved = sum(1 for row in st.session_state.rename_rows if row["status"] == "Renamed")
-    folders = sorted({str(Path(item).parent) for item in st.session_state.selected_paths})
-    st.success(f"Renamed {saved} file(s) in {', '.join(folders)}")
+    if CLOUD_MODE or not supports_native_picker():
+        st.success(f"Prepared {saved} renamed file(s) for download.")
+    else:
+        folders = sorted({str(path.parent) for _, _, _, path in parsed if path is not None})
+        st.success(f"Renamed {saved} file(s) in {', '.join(folders)}")
     st.dataframe(st.session_state.rename_rows, width="stretch", hide_index=True)
     if st.session_state.get("zip_bytes"):
         zip_count = sum(
