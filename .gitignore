@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+renamed_challans/
+sample_pdfs/
+*.zip
