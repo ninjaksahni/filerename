@@ -19,6 +19,10 @@ def test_app_upload_sku_and_rename(tmp_path: Path) -> None:
     assert sku_inputs, [widget.label for widget in at.text_input]
     sku_inputs[0].set_value("DG1").run()
 
+    confirm = [button for button in at.button if "Confirm SKU mapping" in button.label]
+    assert confirm
+    confirm[0].click().run()
+
     rename = [button for button in at.button if "Rename" in button.label]
     assert rename
     rename[0].click().run()

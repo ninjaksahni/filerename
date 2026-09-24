@@ -174,6 +174,70 @@ def _reset_results() -> None:
     st.session_state.rename_rows = None
     st.session_state.zip_bytes = None
     st.session_state.zip_filename = None
+    st.session_state.sku_confirmed = False
+    st.session_state.confirmed_sku_by_key = {}
+
+
+def _reset_rename_results() -> None:
+    st.session_state.rename_rows = None
+    st.session_state.zip_bytes = None
+    st.session_state.zip_filename = None
+
+
+def _build_preview_rows(
+    results: list[ExtractedChallan],
+    ok_results: list[ExtractedChallan],
+    sku_by_key: dict[str, str],
+    store: dict,
+    *,
+    confirmed: bool,
+) -> list[dict]:
+    preview_rows = []
+    for result in results:
+        if result not in ok_results:
+            preview_rows.append(
+                {
+                    "Original": result.source_name,
+                    "SKU(s)": "",
+                    "New name": "",
+                    "Status": result.error or "Skipped",
+                }
+            )
+            continue
+        sku_labels = [
+            sku_by_key.get(product_key(product), "")
+            for product in result.products
+        ]
+        sku_display = " | ".join(filter(None, sku_labels))
+        if not confirmed:
+            preview_rows.append(
+                {
+                    "Original": result.source_name,
+                    "SKU(s)": sku_display or "—",
+                    "New name": "",
+                    "Status": "Waiting for confirmation",
+                }
+            )
+            continue
+        try:
+            preview_rows.append(
+                {
+                    "Original": result.source_name,
+                    "SKU(s)": sku_display,
+                    "New name": _preview_name(result, sku_by_key, store),
+                    "Status": "Ready",
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            preview_rows.append(
+                {
+                    "Original": result.source_name,
+                    "SKU(s)": sku_display,
+                    "New name": "",
+                    "Status": str(exc),
+                }
+            )
+    return preview_rows
 
 
 st.title("Delivery Challan Renamer")
@@ -191,6 +255,10 @@ else:
 store = load_store()
 if "selected_paths" not in st.session_state:
     st.session_state.selected_paths = []
+if "sku_confirmed" not in st.session_state:
+    st.session_state.sku_confirmed = False
+if "confirmed_sku_by_key" not in st.session_state:
+    st.session_state.confirmed_sku_by_key = {}
 
 if CLOUD_MODE or not supports_native_picker():
     uploads = st.file_uploader(
@@ -293,40 +361,48 @@ for key, description, count in unique_products:
     st.caption(f"Used in {count} file(s)")
 
 missing_skus = [desc for key, desc, _ in unique_products if not sku_by_key[key]]
-can_rename = not missing_skus and bool(ok_results)
+can_confirm = not missing_skus and bool(ok_results)
+mapping_changed = sku_by_key != st.session_state.get("confirmed_sku_by_key", {})
+if mapping_changed:
+    st.session_state.sku_confirmed = False
 
-st.subheader("Preview")
-preview_rows = []
-for result in results:
-    if result not in ok_results:
-        preview_rows.append(
-            {
-                "Original": result.source_name,
-                "New name": "",
-                "Status": result.error or "Skipped",
-            }
-        )
-        continue
-    try:
-        preview_rows.append(
-            {
-                "Original": result.source_name,
-                "New name": _preview_name(result, sku_by_key, store),
-                "Status": "Ready" if can_rename else "Waiting for SKUs",
-            }
-        )
-    except Exception as exc:  # noqa: BLE001
-        preview_rows.append(
-            {
-                "Original": result.source_name,
-                "New name": "",
-                "Status": str(exc),
-            }
-        )
-st.dataframe(preview_rows, width="stretch", hide_index=True)
+if st.button("Confirm SKU mapping", type="primary", disabled=not can_confirm):
+    st.session_state.confirmed_sku_by_key = dict(sku_by_key)
+    st.session_state.sku_confirmed = True
+    _reset_rename_results()
+    st.rerun()
 
 if missing_skus:
-    st.warning("Enter an SKU for every product before renaming.")
+    st.warning("Enter an SKU for every product before confirming.")
+elif not st.session_state.sku_confirmed:
+    st.info("Confirm the SKU mapping to preview renamed filenames.")
+
+if st.session_state.sku_confirmed:
+    st.subheader("Confirmed mapping")
+    mapping_rows = [
+        {
+            "Product": description,
+            "SKU": st.session_state.confirmed_sku_by_key[key],
+            "Used in": f"{count} file(s)",
+        }
+        for key, description, count in unique_products
+    ]
+    st.dataframe(mapping_rows, width="stretch", hide_index=True)
+
+preview_sku_by_key = (
+    st.session_state.confirmed_sku_by_key if st.session_state.sku_confirmed else sku_by_key
+)
+can_rename = st.session_state.sku_confirmed and bool(ok_results)
+
+st.subheader("Preview")
+preview_rows = _build_preview_rows(
+    results,
+    ok_results,
+    preview_sku_by_key,
+    store,
+    confirmed=st.session_state.sku_confirmed,
+)
+st.dataframe(preview_rows, width="stretch", hide_index=True)
 
 mmmyy_values = {result.mmmyy for result in ok_results if result.mmmyy}
 zip_file_count = len(ok_results)
@@ -349,11 +425,13 @@ elif mmmyy_values:
 rename_label = "Rename and download" if CLOUD_MODE or not supports_native_picker() else "Rename files"
 if st.button(rename_label, type="primary", disabled=not can_rename):
     merged = dict(store["sku_mappings"])
-    merged.update({key: sku for key, sku in sku_by_key.items() if sku})
+    merged.update(
+        {key: sku for key, sku in st.session_state.confirmed_sku_by_key.items() if sku}
+    )
     store = save_sku_mappings(merged)
     rows, zip_bytes, updated = _write_renamed(
         parsed,
-        sku_by_key,
+        st.session_state.confirmed_sku_by_key,
         store,
         rename_in_place=supports_native_picker() and not CLOUD_MODE,
     )
